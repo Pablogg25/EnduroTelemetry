@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>EnduroData · GPX mínimo</title>
+<style>
+  body{font-family:sans-serif; max-width:700px; margin:20px auto; padding:0 12px;}
+  #stats span{display:inline-block; margin-right:16px; font-size:14px;}
+  #stats b{display:block; font-size:18px;}
+  svg{width:100%; height:320px; background:#eef; border-radius:8px; margin-top:10px;}
+  .zone{background:#fdecea; padding:6px 10px; border-radius:6px; margin-bottom:4px; font-size:13px;}
+</style>
+</head>
+<body>
+<h2>EnduroData — GPX mínimo</h2>
+<input type="file" id="file" accept=".gpx">
+<div id="stats"></div>
+<svg id="map" viewBox="0 0 600 320"></svg>
+<div id="zones"></div>
+
+<script>
+document.getElementById('file').addEventListener('change', e => {
+  const reader = new FileReader();
+  reader.onload = ev => run(parseGPX(ev.target.result));
+  reader.readAsText(e.target.files[0]);
+});
+
+function parseGPX(text){
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  return [...doc.getElementsByTagName('trkpt')].map(pt => ({
+    lat: parseFloat(pt.getAttribute('lat')),
+    lon: parseFloat(pt.getAttribute('lon')),
+    ele: parseFloat(pt.getElementsByTagName('ele')[0]?.textContent || 0),
+    t: Date.parse(pt.getElementsByTagName('time')[0]?.textContent || '') || null
+  })).filter(p => !isNaN(p.lat) && !isNaN(p.lon));
+}
+
+function haversine(a,b){
+  const R=6371000, r=d=>d*Math.PI/180;
+  const dLat=r(b.lat-a.lat), dLon=r(b.lon-a.lon);
+  const x=Math.sin(dLat/2)**2 + Math.cos(r(a.lat))*Math.cos(r(b.lat))*Math.sin(dLon/2)**2;
+  return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+}
+
+function bearing(a,b){
+  const r=d=>d*Math.PI/180, D=r=>r*180/Math.PI;
+  const y=Math.sin(r(b.lon-a.lon))*Math.cos(r(b.lat));
+  const x=Math.cos(r(a.lat))*Math.sin(r(b.lat))-Math.sin(r(a.lat))*Math.cos(r(b.lat))*Math.cos(r(b.lon-a.lon));
+  return (D(Math.atan2(y,x))+360)%360;
+}
+
+function run(points){
+  if (points.length < 2){ alert('GPX sin puntos válidos'); return; }
+
+  // métricas por segmento
+  const segs = [];
+  let dist=0, elevGain=0, maxSpeed=0;
+  for (let i=1;i<points.length;i++){
+    const a=points[i-1], b=points[i];
+    const d=haversine(a,b);
+    const dt=(a.t&&b.t)?(b.t-a.t)/1000:1;
+    const speed=dt>0?(d/dt)*3.6:0;
+    const grade=d>0?(b.ele-a.ele)/d:0;
+    if (b.ele>a.ele) elevGain+=b.ele-a.ele;
+    dist+=d;
+    if (speed<200) maxSpeed=Math.max(maxSpeed,speed);
+    segs.push({a,b,d,speed,grade,brg:bearing(a,b)});
+  }
+  const totalTime=(points[0].t&&points.at(-1).t)?(points.at(-1).t-points[0].t)/1000:null;
+  const avgSpeed=totalTime?(dist/1000)/(totalTime/3600):0;
+
+  // detección de tramos técnicos (proxy GPS)
+  const speeds=segs.map(s=>s.speed);
+  const med=[...speeds].sort((a,b)=>a-b)[Math.floor(speeds.length/2)]||1;
+  const win=8;
+  const flags=segs.map((s,i)=>{
+    const lo=Math.max(0,i-win), hi=Math.min(segs.length,i+win);
+    let turn=0;
+    for(let j=lo+1;j<hi;j++){let diff=Math.abs(segs[j].brg-segs[j-1].brg); if(diff>180)diff=360-diff; turn+=diff;}
+    const density=turn/(hi-lo||1);
+    const slow=s.speed<med*0.45 && med>3;
+    const turny=density>25;
+    const steep=Math.abs(s.grade)>0.12;
+    return (slow&&turny)||(slow&&steep)||(turny&&steep);
+  });
+
+  // stats
+  document.getElementById('stats').innerHTML = `
+    <span><b>${(dist/1000).toFixed(1)} km</b>distancia</span>
+    <span><b>${totalTime?Math.round(totalTime/60)+' min':'—'}</b>duración</span>
+    <span><b>${Math.round(elevGain)} m</b>desnivel +</span>
+    <span><b>${avgSpeed.toFixed(1)} km/h</b>vel. media</span>
+    <span><b>${maxSpeed.toFixed(0)} km/h</b>vel. máxima</span>`;
+
+  // dibujo SVG (proyección simple lat/lon -> pixeles)
+  const lats=points.map(p=>p.lat), lons=points.map(p=>p.lon);
+  const minLat=Math.min(...lats), maxLat=Math.max(...lats);
+  const minLon=Math.min(...lons), maxLon=Math.max(...lons);
+  const W=600,H=320,pad=15;
+  const sx=lon => pad + (lon-minLon)/((maxLon-minLon)||1) * (W-2*pad);
+  const sy=lat => H-pad - (lat-minLat)/((maxLat-minLat)||1) * (H-2*pad);
+
+  const pathPts = points.map(p => `${sx(p.lon)},${sy(p.lat)}`).join(' ');
+  let svg = `<polyline points="${pathPts}" fill="none" stroke="#3a86ff" stroke-width="2"/>`;
+  segs.forEach((s,i) => {
+    if (flags[i]){
+      svg += `<line x1="${sx(s.a.lon)}" y1="${sy(s.a.lat)}" x2="${sx(s.b.lon)}" y2="${sy(s.b.lat)}" stroke="#c0392b" stroke-width="3"/>`;
+    }
+  });
+  document.getElementById('map').innerHTML = svg;
+
+  // zonas técnicas agrupadas
+  const zones=[]; let cur=null;
+  segs.forEach((s,i)=>{
+    if(flags[i]){ if(!cur) cur={start:i,dist:0}; cur.dist+=s.d; }
+    else if(cur){ if(cur.dist>25) zones.push(cur); cur=null; }
+  });
+  if(cur && cur.dist>25) zones.push(cur);
+
+  document.getElementById('zones').innerHTML = zones.length
+    ? zones.map((z,i)=>`<div class="zone">Tramo técnico ${i+1}: ${z.dist.toFixed(0)} m</div>`).join('')
+    : '<p>No se detectaron tramos técnicos claros.</p>';
+}
+</script>
+</body>
+</html>
